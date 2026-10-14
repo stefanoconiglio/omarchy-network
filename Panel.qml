@@ -7,6 +7,7 @@ import Quickshell.Networking
 import qs.Ui
 import qs.Commons
 import "Model.js" as Model
+import "Latency.js" as Latency
 
 Panel {
   id: root
@@ -49,6 +50,17 @@ Panel {
   property int internetPingPacketLoss: 0
   readonly property int pingHistoryWindow: 24
   readonly property int pingAverageWindow: 5
+
+  // The latency in the bar, left of the icon (Latency.js): the last internet
+  // ping of the status reads above, kept apart from the panel's samples, which
+  // are cleared each time the panel closes.
+  property real barLatencyMs: 0
+  property real barRouterMs: -1
+  property bool barHasReply: false
+  property real barLastHeard: Date.now()   // the last reply, or the start before any
+  property real barNow: Date.now()
+  readonly property bool barVertical: bar ? bar.vertical === true : false
+  readonly property string barReading: Latency.status(barLatencyMs, barHasReply, barNow - barLastHeard)
   readonly property bool hasInternetPing: internetPingSamples.length > 0
   // Every stat row stays mounted whether or not there is data behind it, so a
   // sample arriving late never reflows the grid. This says whether the numbers
@@ -508,6 +520,16 @@ Panel {
   function updateDetails(raw) {
     var next = Model.parseKeyValue(raw)
 
+    var internetMs = Latency.sampleMs(next.internet_ping_ms)
+    if (internetMs !== null) {
+      barLatencyMs = internetMs
+      barHasReply = true
+      barLastHeard = Date.now()
+      barNow = barLastHeard
+    }
+    var routerMs = Latency.sampleMs(next.router_ping_ms)
+    barRouterMs = routerMs === null ? -1 : routerMs
+
     // A band change tears the link down and brings it back, and the status
     // command reports nothing at all while there is no route. Publishing that
     // would blank every stat and unmount the whole section mid-toggle, so the
@@ -801,8 +823,8 @@ Panel {
     runNetworkAction("forget", net ? networkForSsid(net.ssid) : null, function(network) { network.forget() })
   }
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: barVertical ? button.implicitWidth : outlineBox.width + Style.space(10)
+  implicitHeight: barVertical ? button.implicitHeight : barFace.implicitHeight
 
   Component.onCompleted: refresh()
 
@@ -898,6 +920,24 @@ Panel {
     onTriggered: if (!detailsProc.running) detailsProc.running = true
   }
 
+  // The bar shows the latency all the time, so the same status (with its one
+  // ping each way) is read while the panel is closed too, more slowly.
+  Timer {
+    id: barPoll
+    interval: 5000
+    repeat: true
+    running: !root.opened
+    onTriggered: if (!detailsProc.running) detailsProc.running = true
+  }
+
+  // The clock that turns a silence into "no net".
+  Timer {
+    interval: 1000
+    repeat: true
+    running: true
+    onTriggered: root.barNow = Date.now()
+  }
+
   Timer {
     id: connectionPhraseTimer
     interval: 2800
@@ -953,19 +993,111 @@ Panel {
     }
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    text: root.icon
+  function togglePanel() {
+    if (root.opened) root.close()
+    // open() is enough: onOpenedChanged runs refresh(true), which defers the
+    // PHY scan past the first frame. The bare refresh() that used to follow
+    // took the no-scan branch and set scannerEnabled synchronously, undoing
+    // that deferral and stalling the open on NetworkManager's AP flood.
+    else root.open()
+  }
 
-    onPressed: function(b) {
-      if (root.opened) root.close()
-      // open() is enough: onOpenedChanged runs refresh(true), which defers the
-      // PHY scan past the first frame. The bare refresh() that used to follow
-      // took the no-scan branch and set scannerEnabled synchronously, undoing
-      // that deferral and stalling the open on NetworkManager's AP flood.
-      else root.open()
+  // The outlined widgets' colours (Attention.qml): the bar's text colour,
+  // orange when slow, red when bad or down.
+  Attention { id: attention; bar: root.bar }
+
+  function barColor(reading) {
+    if (reading === "bad" || reading === "down") return attention.red
+    if (reading === "slow") return attention.orange
+    if (reading === "waiting") return attention.dim
+    return attention.normal
+  }
+
+  function barTooltip() {
+    var text = "Internet ping " + Latency.label(barReading, barLatencyMs)
+    if (barReading !== "down" && barRouterMs >= 0) text += " · router " + Latency.label("good", barRouterMs)
+    return text + "\nEvery 5 s, every 1.5 s with the panel open"
+  }
+
+  // Same geometry as the other outlined widgets: even width, height of the
+  // bar's parity, so centring leaves no half pixel.
+  Rectangle {
+    id: outlineBox
+    visible: !root.barVertical
+    anchors.centerIn: parent
+    width: {
+      var w = Math.ceil(barFace.implicitWidth) + Style.space(8)
+      return w % 2 === 0 ? w : w + 1
+    }
+    height: {
+      var size = root.bar ? root.bar.barSize : Style.bar.sizeHorizontal
+      var h = size - Style.space(6)
+      return (size - h) % 2 === 0 ? h : h - 1
+    }
+    radius: height / 2
+    color: "transparent"
+    border.width: Math.max(1, Math.round(Style.space(1.5)))
+    border.color: attention.outline
+  }
+
+  Row {
+    id: barFace
+    anchors.centerIn: parent
+
+    // The latency in the outlined widgets' type (bold, title size), drawn by
+    // hand since WidgetButton has no bold: so the item registers as a click
+    // target and reports tooltipHovered itself, as WidgetButton would.
+    Item {
+      id: latency
+      visible: !root.barVertical
+      width: visible ? latencyText.width + Style.space(8) : 0
+      height: root.bar ? root.bar.barSize : Style.bar.sizeHorizontal
+      readonly property bool tooltipHovered: latencyMouse.containsMouse
+
+      Component.onCompleted: if (root.bar && root.bar.registerClickTarget) root.bar.registerClickTarget(latency)
+      Component.onDestruction: if (root.bar && root.bar.unregisterClickTarget) root.bar.unregisterClickTarget(latency)
+
+      FontMetrics { id: latencyMetrics; font: latencyText.font }
+      // Digits set the baseline, so the text sits centred in the bar.
+      TextMetrics { id: digitInk; font: latencyText.font; text: "88" }
+      // Room for the widest reading, so the widgets beside it never move.
+      TextMetrics { id: slotInk; font: latencyText.font; text: "no net" }
+
+      Text {
+        id: latencyText
+        x: Style.space(4)
+        y: Math.round((latency.height - digitInk.tightBoundingRect.height) / 2
+                      - digitInk.tightBoundingRect.y - latencyMetrics.ascent)
+        width: Math.max(implicitWidth, slotInk.width)
+        horizontalAlignment: Text.AlignRight
+        textFormat: Text.PlainText
+        text: Latency.label(root.barReading, root.barLatencyMs)
+        color: root.barColor(root.barReading)
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      MouseArea {
+        id: latencyMouse
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onEntered: if (root.bar) root.bar.showTooltip(latency, root.barTooltip())
+        onExited: if (root.bar) root.bar.hideTooltip(latency)
+        onClicked: {
+          if (root.bar) root.bar.hideTooltip(latency)
+          root.togglePanel()
+        }
+      }
+    }
+
+    BarIconButton {
+      id: button
+      bar: root.bar
+      text: root.icon
+      onPressed: function(b) { root.togglePanel() }
     }
   }
 
